@@ -48,108 +48,39 @@ class TextRequest(BaseModel):
 
 
 def extract_text_from_image(image: Image.Image, lang: str = 'tam+eng') -> str:
-    """Extract text from image using Tesseract OCR with adaptive thresholding"""
+    """Extract text from image using Tesseract OCR - simplified direct approach"""
     try:
-        from PIL import ImageEnhance, ImageOps, ImageFilter
-        import numpy as np
+        from PIL import ImageEnhance
         
-        results = []
+        # Simple direct approach - minimal preprocessing
+        img = image.convert('L')
         
-        # Strategy 1: Tamil-only with adaptive threshold
-        try:
-            img = image.convert('L')
-            # Convert to numpy array for better thresholding
-            img_array = np.array(img)
-            # Adaptive threshold - best for handwriting
-            from PIL import Image as PILImage
-            threshold = img_array.mean()
-            binary = (img_array > threshold) * 255
-            img = PILImage.fromarray(binary.astype(np.uint8))
-            
-            # Upscale if small
-            width, height = img.size
-            if width < 800:
-                scale = 800 / width
-                img = img.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
-            
-            # Tamil only, single line
-            text = pytesseract.image_to_string(img, lang='tam', config='--oem 3 --psm 7')
-            if text.strip():
-                results.append(('tam_adaptive', text.strip()))
-        except:
-            pass
+        # Moderate upscaling
+        width, height = img.size
+        if width < 1200:
+            scale = 1200 / width
+            img = img.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
         
-        # Strategy 2: High contrast Tamil-only
-        try:
-            img = image.convert('L')
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(3.0)
-            
-            width, height = img.size
-            if width < 800:
-                scale = 800 / width
-                img = img.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
-            
-            text = pytesseract.image_to_string(img, lang='tam', config='--oem 3 --psm 7')
-            if text.strip():
-                results.append(('tam_contrast', text.strip()))
-        except:
-            pass
+        # Light contrast boost
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.8)
         
-        # Strategy 3: Original with Tamil+English
-        try:
-            img = image.convert('L')
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(2.0)
-            
-            width, height = img.size
-            if width < 800:
-                scale = 800 / width
-                img = img.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
-            
-            text = pytesseract.image_to_string(img, lang='tam+eng', config='--oem 3 --psm 6')
-            if text.strip():
-                results.append(('mixed', text.strip()))
-        except:
-            pass
+        # Try Tamil-only first with PSM 6 (block of text)
+        text = pytesseract.image_to_string(img, lang='tam', config='--oem 3 --psm 6')
         
-        # Strategy 4: Inverted with binary threshold
-        try:
-            img = ImageOps.invert(image.convert('L'))
-            img_array = np.array(img)
-            threshold = img_array.mean()
-            binary = (img_array > threshold) * 255
-            img = PILImage.fromarray(binary.astype(np.uint8))
-            
-            width, height = img.size
-            if width < 800:
-                scale = 800 / width
-                img = img.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
-            
-            text = pytesseract.image_to_string(img, lang='tam', config='--oem 3 --psm 7')
-            if text.strip():
-                results.append(('inverted', text.strip()))
-        except:
-            pass
+        if text.strip() and len(text.strip()) > 3:
+            return text.strip()
         
-        if results:
-            # Prioritize Tamil-only results
-            tamil_only = [r for r in results if r[0].startswith('tam_')]
-            if tamil_only:
-                # Return the one with most Tamil characters
-                best = max(tamil_only, key=lambda x: sum(1 for c in x[1] if '\u0B80' <= c <= '\u0BFF'))
-                return best[1]
-            
-            # Otherwise return longest with Tamil
-            tamil_results = [r for r in results if any('\u0B80' <= c <= '\u0BFF' for c in r[1])]
-            if tamil_results:
-                best = max(tamil_results, key=lambda x: len(x[1]))
-                return best[1]
-            
-            # Fallback to any result
-            return max(results, key=lambda x: len(x[1]))[1]
+        # Fallback: Tamil+English with PSM 6
+        text = pytesseract.image_to_string(img, lang='tam+eng', config='--oem 3 --psm 6')
         
-        return ""
+        if text.strip():
+            return text.strip()
+        
+        # Last resort: just use defaults
+        text = pytesseract.image_to_string(img, lang='tam')
+        
+        return text.strip() if text.strip() else ""
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OCR Error: {str(e)}")
