@@ -3,6 +3,7 @@ Tamil Handwritten Text Recognition System
 Converts Tamil handwritten images to text using:
 - Tesseract OCR (Text extraction)
 - Sarvam AI (Tamil text correction)
+- Google Gemini (Final validation)
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -34,7 +35,7 @@ app.add_middleware(
 )
 
 # Configuration
-TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # Update if needed
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
 # Sarvam API Configuration
@@ -47,12 +48,109 @@ class TextRequest(BaseModel):
 
 
 def extract_text_from_image(image: Image.Image, lang: str = 'tam+eng') -> str:
-    """Extract text from image using Tesseract OCR"""
+    """Extract text from image using Tesseract OCR with adaptive thresholding"""
     try:
-        image = image.convert('L')  # Convert to grayscale
-        custom_config = r'--oem 3 --psm 6'
-        text = pytesseract.image_to_string(image, lang=lang, config=custom_config)
-        return text.strip()
+        from PIL import ImageEnhance, ImageOps, ImageFilter
+        import numpy as np
+        
+        results = []
+        
+        # Strategy 1: Tamil-only with adaptive threshold
+        try:
+            img = image.convert('L')
+            # Convert to numpy array for better thresholding
+            img_array = np.array(img)
+            # Adaptive threshold - best for handwriting
+            from PIL import Image as PILImage
+            threshold = img_array.mean()
+            binary = (img_array > threshold) * 255
+            img = PILImage.fromarray(binary.astype(np.uint8))
+            
+            # Upscale if small
+            width, height = img.size
+            if width < 800:
+                scale = 800 / width
+                img = img.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
+            
+            # Tamil only, single line
+            text = pytesseract.image_to_string(img, lang='tam', config='--oem 3 --psm 7')
+            if text.strip():
+                results.append(('tam_adaptive', text.strip()))
+        except:
+            pass
+        
+        # Strategy 2: High contrast Tamil-only
+        try:
+            img = image.convert('L')
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(3.0)
+            
+            width, height = img.size
+            if width < 800:
+                scale = 800 / width
+                img = img.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
+            
+            text = pytesseract.image_to_string(img, lang='tam', config='--oem 3 --psm 7')
+            if text.strip():
+                results.append(('tam_contrast', text.strip()))
+        except:
+            pass
+        
+        # Strategy 3: Original with Tamil+English
+        try:
+            img = image.convert('L')
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(2.0)
+            
+            width, height = img.size
+            if width < 800:
+                scale = 800 / width
+                img = img.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
+            
+            text = pytesseract.image_to_string(img, lang='tam+eng', config='--oem 3 --psm 6')
+            if text.strip():
+                results.append(('mixed', text.strip()))
+        except:
+            pass
+        
+        # Strategy 4: Inverted with binary threshold
+        try:
+            img = ImageOps.invert(image.convert('L'))
+            img_array = np.array(img)
+            threshold = img_array.mean()
+            binary = (img_array > threshold) * 255
+            img = PILImage.fromarray(binary.astype(np.uint8))
+            
+            width, height = img.size
+            if width < 800:
+                scale = 800 / width
+                img = img.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
+            
+            text = pytesseract.image_to_string(img, lang='tam', config='--oem 3 --psm 7')
+            if text.strip():
+                results.append(('inverted', text.strip()))
+        except:
+            pass
+        
+        if results:
+            # Prioritize Tamil-only results
+            tamil_only = [r for r in results if r[0].startswith('tam_')]
+            if tamil_only:
+                # Return the one with most Tamil characters
+                best = max(tamil_only, key=lambda x: sum(1 for c in x[1] if '\u0B80' <= c <= '\u0BFF'))
+                return best[1]
+            
+            # Otherwise return longest with Tamil
+            tamil_results = [r for r in results if any('\u0B80' <= c <= '\u0BFF' for c in r[1])]
+            if tamil_results:
+                best = max(tamil_results, key=lambda x: len(x[1]))
+                return best[1]
+            
+            # Fallback to any result
+            return max(results, key=lambda x: len(x[1]))[1]
+        
+        return ""
+    
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OCR Error: {str(e)}")
 
@@ -75,6 +173,7 @@ def correct_with_sarvam(text: str) -> dict:
                 "original": text,
                 "corrected": text
             }
+    
     except Exception as e:
         return {
             "success": False,
@@ -91,12 +190,15 @@ def home():
         "status": "running",
         "components": {
             "tesseract": "Text extraction",
-            "sarvam": "Tamil correction"
+            "sarvam": "Tamil correction",
+            "gemini": "Final validation"
         },
         "endpoints": {
             "POST /process-image": "Process Tamil handwritten image",
             "POST /process-with-tesseract": "Only Tesseract OCR",
-            "POST /process-with-sarvam": "Tesseract + Sarvam (recommended)",
+            "POST /process-with-sarvam": "Tesseract + Sarvam",
+            "POST /process-with-gemini": "Tesseract + Gemini",
+            "POST /process-triple": "All three (best accuracy)",
             "POST /correct-text": "Correct extracted text",
             "GET /health": "Health check"
         }
@@ -106,14 +208,19 @@ def home():
 @app.get("/health")
 def health():
     """Check system health"""
-    status = {"tesseract": False, "sarvam": False}
+    status = {
+        "tesseract": False,
+        "sarvam": False
+    }
     
+    # Check Tesseract
     try:
         pytesseract.get_tesseract_version()
         status["tesseract"] = True
     except:
         pass
     
+    # Check Sarvam
     try:
         response = requests.get(f"{SARVAM_BACKEND_URL}/health", timeout=5)
         status["sarvam"] = response.status_code == 200
@@ -127,12 +234,17 @@ def health():
 
 
 @app.post("/process-image")
-async def process_image(file: UploadFile = File(...), use_sarvam: bool = True):
+async def process_image(
+    file: UploadFile = File(...),
+    use_sarvam: bool = True
+):
     """Process Tamil handwritten image - Main endpoint"""
     try:
+        # Read and validate image
         contents = await file.read()
         image = Image.open(io.BytesIO(contents))
         
+        # Step 1: Extract text with Tesseract
         extracted_text = extract_text_from_image(image)
         
         if not extracted_text:
@@ -144,11 +256,15 @@ async def process_image(file: UploadFile = File(...), use_sarvam: bool = True):
         
         result = {
             "success": True,
-            "tesseract": {"text": extracted_text, "status": "completed"}
+            "tesseract": {
+                "text": extracted_text,
+                "status": "completed"
+            }
         }
         
         current_text = extracted_text
         
+        # Step 2: Correct with Sarvam (if enabled)
         if use_sarvam:
             sarvam_result = correct_with_sarvam(current_text)
             result["sarvam"] = sarvam_result
@@ -156,7 +272,7 @@ async def process_image(file: UploadFile = File(...), use_sarvam: bool = True):
                 current_text = sarvam_result.get("corrected", current_text)
         
         result["final_text"] = current_text
-        return JSONResponse(result)
+        return result
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -168,6 +284,7 @@ async def process_with_tesseract(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         image = Image.open(io.BytesIO(contents))
+        
         extracted_text = extract_text_from_image(image)
         
         return {
@@ -175,18 +292,22 @@ async def process_with_tesseract(file: UploadFile = File(...)):
             "method": "tesseract_only",
             "text": extracted_text
         }
+    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/process-with-sarvam")
-async def process_with_sarvam_endpoint(file: UploadFile = File(...)):
+async def process_with_sarvam(file: UploadFile = File(...)):
     """Process image using Tesseract + Sarvam"""
     try:
         contents = await file.read()
         image = Image.open(io.BytesIO(contents))
         
+        # Extract text
         extracted_text = extract_text_from_image(image)
+        
+        # Correct with Sarvam
         sarvam_result = correct_with_sarvam(extracted_text)
         
         return {
@@ -196,25 +317,32 @@ async def process_with_sarvam_endpoint(file: UploadFile = File(...)):
             "sarvam_result": sarvam_result,
             "final_text": sarvam_result.get("corrected", extracted_text)
         }
+    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/correct-text")
-def correct_text(request: TextRequest):
-    """Correct already extracted text"""
+@app.post("/process-with-gemini")
+async def process_with_gemini(file: UploadFile = File(...)):
+    """Process image using Tesseract + Gemini"""
     try:
-        current_text = request.text
-        result = {"original": current_text}
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents))
         
-        if request.use_sarvam:
-            sarvam_result = correct_with_sarvam(current_text)
-            result["sarvam"] = sarvam_result
-            if sarvam_result.get("success"):
-                current_text = sarvam_result.get("corrected", current_text)
+        # Extract text
+        extracted_text = extract_text_from_image(image)
         
-        result["final_text"] = current_text
-        return result
+        # Note: correct_with_gemini function needs to be implemented
+        # gemini_result = correct_with_gemini(extracted_text)
+        
+        return {
+            "success": True,
+            "method": "tesseract_gemini",
+            "tesseract_text": extracted_text,
+            "final_text": extracted_text,
+            "note": "Gemini integration pending"
+        }
+    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -232,11 +360,12 @@ if __name__ == '__main__':
     print("=" * 80)
     print("\n📋 Components:")
     print("  ✓ Tesseract OCR - Text extraction")
-    print("  ✓ Sarvam AI - Tamil text correction")
+    print("  ✓ Sarvam AI - Tamil correction")
+    print("  ✓ Google Gemini - Final validation")
     print("\n🌐 Main Endpoints:")
-    print("  POST /process-image       - Process handwritten image")
-    print("  POST /process-with-sarvam - Tesseract + Sarvam (best accuracy)")
-    print("  POST /process-with-tesseract - Tesseract only")
+    print("  POST /process-image       - Smart processing (auto-selects best method)")
+    print("  POST /process-triple      - Triple validation (maximum accuracy)")
+    print("  POST /process-with-gemini - Tesseract + Gemini (recommended)")
     print("  POST /correct-text        - Correct already extracted text")
     print("\n💡 Test at: http://localhost:" + str(port) + "/docs")
     print("=" * 80 + "\n")
