@@ -1,17 +1,17 @@
 """
 Tamil Handwritten Text Recognition System
 Converts Tamil handwritten images to text using:
-- Tesseract OCR (Text extraction)
+- PaddleOCR (Deep learning OCR for Tamil text extraction)
 - Sarvam AI (Tamil text correction)
-- Google Gemini (Final validation)
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import pytesseract
 from PIL import Image
+from paddleocr import PaddleOCR
+import numpy as np
 import io
 import os
 import requests
@@ -22,7 +22,7 @@ load_dotenv()
 
 app = FastAPI(
     title="Tamil Handwritten Text Recognition",
-    description="Convert Tamil handwritten images to text using Tesseract OCR and Sarvam AI"
+    description="Convert Tamil handwritten images to text using PaddleOCR and Sarvam AI"
 )
 
 # CORS Configuration
@@ -34,9 +34,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration
-TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # Update if needed
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+# PaddleOCR Configuration
+print("Loading PaddleOCR reader for Tamil...")
+try:
+    # Initialize PaddleOCR with Tamil language (CPU mode)
+    ocr = PaddleOCR(lang='ta', use_textline_orientation=True)
+    print("[OK] PaddleOCR loaded successfully with Tamil support!")
+except Exception as e:
+    print(f"[ERROR] Error loading PaddleOCR: {e}")
+    ocr = None
 
 # Sarvam API Configuration
 SARVAM_BACKEND_URL = os.getenv("SARVAM_BACKEND_URL", "http://localhost:5000")
@@ -47,43 +53,43 @@ class TextRequest(BaseModel):
     use_sarvam: bool = True
 
 
-def extract_text_from_image(image: Image.Image, lang: str = 'tam+eng') -> str:
-    """Extract text from image using Tesseract OCR - simplified direct approach"""
+def extract_text_from_image(image: Image.Image, lang: str = None) -> str:
+    """Extract Tamil text from image using PaddleOCR"""
     try:
-        from PIL import ImageEnhance
+        print(f"[DEBUG] Starting PaddleOCR extraction. Image mode: {image.mode}, Size: {image.size}")
         
-        # Simple direct approach - minimal preprocessing
-        img = image.convert('L')
+        if ocr is None:
+            print("[ERROR] OCR is None!")
+            raise HTTPException(status_code=500, detail="PaddleOCR not loaded")
         
-        # Moderate upscaling
-        width, height = img.size
-        if width < 1200:
-            scale = 1200 / width
-            img = img.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
+        # Convert PIL Image to numpy array
+        image_np = np.array(image)
+        print(f"[DEBUG] Converted to numpy array. Shape: {image_np.shape}, dtype: {image_np.dtype}")
         
-        # Light contrast boost
-        enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(1.8)
+        # Perform OCR with PaddleOCR
+        print("[DEBUG] Calling ocr.ocr()...")
+        result = ocr.ocr(image_np, cls=True)
+        print(f"[DEBUG] PaddleOCR results: {result}")
         
-        # Try Tamil-only first with PSM 6 (block of text)
-        text = pytesseract.image_to_string(img, lang='tam', config='--oem 3 --psm 6')
+        # Extract text from results
+        # PaddleOCR returns: [[line1, line2, ...]] where each line is [bbox, (text, confidence)]
+        extracted_texts = []
+        if result and result[0]:
+            for line in result[0]:
+                if line and len(line) > 1:
+                    text = line[1][0]  # text is at index 1, element 0
+                    extracted_texts.append(text)
         
-        if text.strip() and len(text.strip()) > 3:
-            return text.strip()
+        extracted_text = ' '.join(extracted_texts)
+        print(f"[DEBUG] Extracted text: {extracted_text}")
         
-        # Fallback: Tamil+English with PSM 6
-        text = pytesseract.image_to_string(img, lang='tam+eng', config='--oem 3 --psm 6')
-        
-        if text.strip():
-            return text.strip()
-        
-        # Last resort: just use defaults
-        text = pytesseract.image_to_string(img, lang='tam')
-        
-        return text.strip() if text.strip() else ""
+        return extracted_text.strip() if extracted_text else ""
     
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR Error: {str(e)}")
+        import traceback
+        print(f"[ERROR] Exception in extract_text_from_image: {type(e).__name__}: {str(e)}")
+        print(f"[ERROR] Traceback:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"PaddleOCR Error: {str(e)}")
 
 
 def correct_with_sarvam(text: str) -> dict:
@@ -120,16 +126,13 @@ def home():
         "service": "Tamil Handwritten Text Recognition",
         "status": "running",
         "components": {
-            "tesseract": "Text extraction",
-            "sarvam": "Tamil correction",
-            "gemini": "Final validation"
+            "easyocr": "Deep learning OCR for Tamil text extraction",
+            "sarvam": "Tamil text correction"
         },
         "endpoints": {
             "POST /process-image": "Process Tamil handwritten image",
-            "POST /process-with-tesseract": "Only Tesseract OCR",
-            "POST /process-with-sarvam": "Tesseract + Sarvam",
-            "POST /process-with-gemini": "Tesseract + Gemini",
-            "POST /process-triple": "All three (best accuracy)",
+            "POST /process-with-easyocr": "Only EasyOCR extraction",
+            "POST /process-with-sarvam": "EasyOCR + Sarvam correction",
             "POST /correct-text": "Correct extracted text",
             "GET /health": "Health check"
         }
@@ -140,16 +143,9 @@ def home():
 def health():
     """Check system health"""
     status = {
-        "tesseract": False,
+        "easyocr": reader is not None,
         "sarvam": False
     }
-    
-    # Check Tesseract
-    try:
-        pytesseract.get_tesseract_version()
-        status["tesseract"] = True
-    except:
-        pass
     
     # Check Sarvam
     try:
@@ -175,19 +171,19 @@ async def process_image(
         contents = await file.read()
         image = Image.open(io.BytesIO(contents))
         
-        # Step 1: Extract text with Tesseract
+        # Step 1: Extract text with EasyOCR
         extracted_text = extract_text_from_image(image)
         
         if not extracted_text:
             return JSONResponse({
                 "success": False,
                 "error": "No text detected in image",
-                "tesseract": {"text": ""}
+                "easyocr": {"text": ""}
             })
         
         result = {
             "success": True,
-            "tesseract": {
+            "easyocr": {
                 "text": extracted_text,
                 "status": "completed"
             }
@@ -209,10 +205,13 @@ async def process_image(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/process-with-tesseract")
-async def process_with_tesseract(file: UploadFile = File(...)):
-    """Process image using only Tesseract OCR"""
+@app.post("/process-with-paddleocr")
+async def process_with_paddleocr(file: UploadFile = File(...)):
+    """Process image using only PaddleOCR"""
     try:
+        if ocr is None:
+            raise HTTPException(status_code=500, detail="PaddleOCR not initialized. Please check server logs.")
+        
         contents = await file.read()
         image = Image.open(io.BytesIO(contents))
         
@@ -220,17 +219,21 @@ async def process_with_tesseract(file: UploadFile = File(...)):
         
         return {
             "success": True,
-            "method": "tesseract_only",
+            "method": "paddleocr_only",
             "text": extracted_text
         }
     
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+        raise HTTPException(status_code=500, detail=error_detail)
 
 
 @app.post("/process-with-sarvam")
 async def process_with_sarvam(file: UploadFile = File(...)):
-    """Process image using Tesseract + Sarvam"""
+    """Process image using EasyOCR + Sarvam"""
     try:
         contents = await file.read()
         image = Image.open(io.BytesIO(contents))
@@ -243,35 +246,10 @@ async def process_with_sarvam(file: UploadFile = File(...)):
         
         return {
             "success": True,
-            "method": "tesseract_sarvam",
-            "tesseract_text": extracted_text,
+            "method": "easyocr_sarvam",
+            "easyocr_text": extracted_text,
             "sarvam_result": sarvam_result,
             "final_text": sarvam_result.get("corrected", extracted_text)
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/process-with-gemini")
-async def process_with_gemini(file: UploadFile = File(...)):
-    """Process image using Tesseract + Gemini"""
-    try:
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
-        
-        # Extract text
-        extracted_text = extract_text_from_image(image)
-        
-        # Note: correct_with_gemini function needs to be implemented
-        # gemini_result = correct_with_gemini(extracted_text)
-        
-        return {
-            "success": True,
-            "method": "tesseract_gemini",
-            "tesseract_text": extracted_text,
-            "final_text": extracted_text,
-            "note": "Gemini integration pending"
         }
     
     except Exception as e:
@@ -284,21 +262,20 @@ if __name__ == '__main__':
     port = int(os.getenv("MAIN_PORT", 8000))
     
     print("\n" + "=" * 80)
-    print("🎯 Tamil Handwritten Text Recognition System")
+    print("Tamil Handwritten Text Recognition System")
     print("=" * 80)
     print(f"Server: http://localhost:{port}")
     print(f"Docs: http://localhost:{port}/docs")
     print("=" * 80)
-    print("\n📋 Components:")
-    print("  ✓ Tesseract OCR - Text extraction")
-    print("  ✓ Sarvam AI - Tamil correction")
-    print("  ✓ Google Gemini - Final validation")
-    print("\n🌐 Main Endpoints:")
-    print("  POST /process-image       - Smart processing (auto-selects best method)")
-    print("  POST /process-triple      - Triple validation (maximum accuracy)")
-    print("  POST /process-with-gemini - Tesseract + Gemini (recommended)")
-    print("  POST /correct-text        - Correct already extracted text")
-    print("\n💡 Test at: http://localhost:" + str(port) + "/docs")
+    print("\nComponents:")
+    print("  [+] EasyOCR - Deep learning Tamil text extraction")
+    print("  [+] Sarvam AI - Tamil text correction")
+    print("\nMain Endpoints:")
+    print("  POST /process-image         - EasyOCR extraction")
+    print("  POST /process-with-easyocr  - EasyOCR extraction only")
+    print("  POST /process-with-sarvam   - EasyOCR + Sarvam correction (recommended)")
+    print("  POST /correct-text          - Correct already extracted text")
+    print("\nTest at: http://localhost:" + str(port) + "/docs")
     print("=" * 80 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

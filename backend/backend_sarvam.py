@@ -1,12 +1,13 @@
 """
 Sarvam AI Backend for Tamil Text Processing
-Uses HuggingFace API with sarvamai model
+Uses local Sarvam model deployment via transformers
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import requests
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
 import uvicorn
 import os
 from dotenv import load_dotenv
@@ -25,23 +26,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# HuggingFace Configuration from environment
-HF_TOKEN = os.getenv("HF_TOKEN")
+# Model Configuration
 SARVAM_MODEL = os.getenv("SARVAM_MODEL", "sarvamai/sarvam-2b-v0.5")
+HF_TOKEN = os.getenv("HF_TOKEN")
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-if not HF_TOKEN:
-    raise ValueError("HF_TOKEN environment variable is required. Set it in backend/.env file")
+print("=" * 80)
+print("Sarvam AI Backend Server (FastAPI) - Local Model")
+print("=" * 80)
+print(f"Model: {SARVAM_MODEL}")
+print(f"Device: {device}")
+print("=" * 80)
+print("Loading Sarvam model locally...")
 
-# Try new router endpoint first, fallback to direct model access
-HF_API_URLS = [
-    f"https://huggingface.co/api/models/{SARVAM_MODEL}",
-    f"https://api-inference.huggingface.co/models/{SARVAM_MODEL}"
-]
+# Load model and tokenizer
+try:
+    tokenizer = AutoTokenizer.from_pretrained(SARVAM_MODEL, token=HF_TOKEN)
+    model = AutoModelForCausalLM.from_pretrained(
+        SARVAM_MODEL,
+        token=HF_TOKEN,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        low_cpu_mem_usage=True
+    )
+    model = model.to(device)
+    model.eval()
+    print(f"[OK] Sarvam model loaded successfully on {device}!")
+    MODEL_LOADED = True
+except Exception as e:
+    print(f"[ERROR] Failed to load Sarvam model: {e}")
+    print("[INFO] Model will be downloaded on first use (this may take time)")
+    tokenizer = None
+    model = None
+    MODEL_LOADED = False
 
-HF_HEADERS = {
-    "Authorization": f"Bearer {HF_TOKEN}",
-    "Content-Type": "application/json"
-}
 
 # Request Models
 class GenerateRequest(BaseModel):
@@ -57,57 +74,47 @@ class TranslateRequest(BaseModel):
     source_lang: str = 'en'
     target_lang: str = 'ta'
 
-print("=" * 80)
-print("Sarvam AI Backend Server (FastAPI)")
-print("=" * 80)
-print(f"Model: {SARVAM_MODEL}")
-print(f"Token: {HF_TOKEN[:20]}...")
-print("=" * 80)
 
-
-def call_sarvam_api(prompt, max_tokens=200, temperature=0.7):
-    """Call Sarvam AI model via HuggingFace Inference API"""
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": max_tokens,
-            "temperature": temperature,
-            "return_full_text": False,
-            "do_sample": True
-        }
-    }
+def generate_text_local(prompt, max_tokens=200, temperature=0.7):
+    """Generate text using local Sarvam model"""
+    global tokenizer, model, MODEL_LOADED
     
-    try:
-        # Note: HuggingFace Inference API for this model is currently unavailable (410 error)
-        # This backend is configured and ready to use when the API becomes available
-        # or when using local model deployment
-        
-        for api_url in HF_API_URLS:
-            response = requests.post(api_url, headers=HF_HEADERS, json=payload, timeout=60)
-            
-            if response.status_code == 200:
-                result = response.json()
-                if isinstance(result, list) and len(result) > 0:
-                    return {"success": True, "text": result[0].get("generated_text", ""), "model": SARVAM_MODEL}
-                elif isinstance(result, dict):
-                    return {"success": True, "text": result.get("generated_text", ""), "model": SARVAM_MODEL}
-                return {"success": False, "error": "Unexpected response"}
-            
-            elif response.status_code == 503:
-                return {"success": False, "error": "Model loading (wait 20-30s)"}
-            
-            elif response.status_code != 410:  # Skip deprecated endpoints
-                return {"success": False, "error": f"API Error {response.status_code}"}
-        
-        # If all endpoints fail
+    if not MODEL_LOADED:
         return {
             "success": False,
-            "error": "HuggingFace Inference API unavailable",
-            "message": "The Sarvam model endpoint is currently deprecated. Backend is configured and ready for when the model becomes available or for local deployment."
+            "error": "Model not loaded",
+            "text": prompt  # Return original text
+        }
+    
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                do_sample=True if temperature > 0 else False,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Remove the prompt from output
+        if generated_text.startswith(prompt):
+            generated_text = generated_text[len(prompt):].strip()
+        
+        return {
+            "success": True,
+            "text": generated_text,
+            "model": SARVAM_MODEL
         }
     
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": str(e),
+            "text": prompt
+        }
 
 
 @app.get("/")
@@ -127,11 +134,11 @@ def home():
 
 @app.get('/health')
 def health():
-    test = call_sarvam_api("Test", max_tokens=5)
     return {
-        "status": "healthy" if test.get("success") else "degraded",
+        "status": "healthy" if MODEL_LOADED else "degraded",
         "model": SARVAM_MODEL,
-        "api_status": test.get("success", False)
+        "model_loaded": MODEL_LOADED,
+        "device": device
     }
 
 
@@ -139,14 +146,14 @@ def health():
 def generate(request: GenerateRequest):
     """Generate text using Sarvam AI"""
     try:
-        result = call_sarvam_api(
+        result = generate_text_local(
             request.prompt,
             request.max_tokens,
             request.temperature
         )
         
         if not result.get("success"):
-            raise HTTPException(status_code=500, detail=result.get("error", "API error"))
+            raise HTTPException(status_code=500, detail=result.get("error", "Generation failed"))
         
         return result
     
@@ -160,28 +167,33 @@ def generate(request: GenerateRequest):
 def correct_tamil(request: CorrectTamilRequest):
     """Correct Tamil OCR text"""
     try:
-        prompt = f"""Correct Tamil text from OCR. Fix errors:
-
-Original: {request.text}
-
-Corrected:"""
+        prompt = f"Correct the following Tamil text for OCR errors:\n\nText: {request.text}\n\nCorrected:"
         
-        result = call_sarvam_api(prompt, max_tokens=300, temperature=0.5)
+        result = generate_text_local(prompt, max_tokens=500, temperature=0.3)
         
         if result.get("success"):
             return {
                 "success": True,
                 "original": request.text,
-                "corrected": result.get("text", ""),
+                "corrected": result.get("text", request.text).strip(),
                 "model": SARVAM_MODEL
             }
         
-        raise HTTPException(status_code=500, detail=result.get("error", "API error"))
+        # Return original text if correction fails
+        return {
+            "success": False,
+            "error": result.get("error", "Correction failed"),
+            "original": request.text,
+            "corrected": request.text
+        }
     
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "success": False,
+            "error": str(e),
+            "original": request.text,
+            "corrected": request.text
+        }
 
 
 @app.post('/translate')
@@ -192,7 +204,7 @@ def translate(request: TranslateRequest):
         
         prompt = f"Translate from {langs.get(request.source_lang, request.source_lang)} to {langs.get(request.target_lang, request.target_lang)}: {request.text}\n\nTranslation:"
         
-        result = call_sarvam_api(prompt, max_tokens=300, temperature=0.3)
+        result = generate_text_local(prompt, max_tokens=300, temperature=0.3)
         
         if result.get("success"):
             return {
@@ -201,7 +213,7 @@ def translate(request: TranslateRequest):
                 "translated": result.get("text", "")
             }
         
-        raise HTTPException(status_code=500, detail=result.get("error", "API error"))
+        raise HTTPException(status_code=500, detail=result.get("error", "Translation failed"))
     
     except HTTPException:
         raise
@@ -213,7 +225,7 @@ if __name__ == '__main__':
     port = int(os.getenv("PORT", 5000))
     host = os.getenv("HOST", "0.0.0.0")
     
-    print("\n🚀 Starting Sarvam AI Backend Server (FastAPI)")
+    print("\nStarting Sarvam AI Backend Server (FastAPI)")
     print("=" * 80)
     print(f"Server: http://localhost:{port}")
     print(f"Docs: http://localhost:{port}/docs")
