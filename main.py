@@ -34,11 +34,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Disable oneDNN to avoid compatibility issues on Windows
+os.environ['FLAGS_use_mkldnn'] = '0'
+
 # PaddleOCR Configuration
 print("Loading PaddleOCR reader for Tamil...")
 try:
-    # Initialize PaddleOCR with Tamil language (CPU mode)
-    ocr = PaddleOCR(lang='ta', use_textline_orientation=True)
+    # Initialize PaddleOCR with Tamil language (CPU mode, oneDNN disabled)
+    ocr = PaddleOCR(lang='ta', use_textline_orientation=True, enable_mkldnn=False)
     print("[OK] PaddleOCR loaded successfully with Tamil support!")
 except Exception as e:
     print(f"[ERROR] Error loading PaddleOCR: {e}")
@@ -68,7 +71,7 @@ def extract_text_from_image(image: Image.Image, lang: str = None) -> str:
         
         # Perform OCR with PaddleOCR
         print("[DEBUG] Calling ocr.ocr()...")
-        result = ocr.ocr(image_np, cls=True)
+        result = ocr.ocr(image_np)
         print(f"[DEBUG] PaddleOCR results: {result}")
         
         # Extract text from results
